@@ -2,12 +2,19 @@ machine:
   pre:
     - curl -sSL https://s3.amazonaws.com/circle-downloads/install-circleci-docker.sh | bash -s -- 1.10.0
 
+  post:
+    - sudo rm -rf /usr/local/go
+    - if [ ! -e go1.6.linux-amd64.tar.gz ]; then curl -O https://storage.googleapis.com/golang/go1.6.linux-amd64.tar.gz; fi
+    - sudo tar -C /usr/local -xzf go1.6.linux-amd64.tar.gz
+
   services:
     - docker
 
 dependencies:
   override:
     - make deps
+  cache_directories:
+    - ~/go1.6.linux-amd64.tar.gz
 
 test:
   override:
