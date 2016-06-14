@@ -29,6 +29,7 @@ import (
 	"net/url"
 	"os"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	// Import postgres driver.
@@ -116,7 +117,7 @@ var generators = map[string]genFn{
 		req.Group = rand.Int63()
 		if req.Group%100 == 0 {
 			// Create some fake contention in ~1% of the requests.
-			req.Group = 1
+			req.Group = int64(atomic.LoadInt32(&num) / 100)
 		}
 		return req
 	},
@@ -143,6 +144,8 @@ func getLast(tx *sql.Tx, accountID string) (lastCID int64, lastBalance int64, er
 	}
 	return
 }
+
+var num int32 // atomically updated
 
 func doPosting(tx *sql.Tx, req postingRequest) error {
 	var cidA, balA, cidB, balB int64
@@ -193,22 +196,31 @@ VALUES (
 func worker(db *sql.DB, l func(string, ...interface{}), gen func() postingRequest) {
 	for {
 		req := gen()
-		l("running %v", req)
+		if req.AccountA == req.AccountB {
+			// The code we use throws a unique constraint violation since we
+			// try to insert two conflicting primary keys. This isn't the
+			// interesting case.
+			continue
+		}
+		if *verbose {
+			l("running %v", req)
+		}
 		if err := crdb.ExecuteTx(db, func(tx *sql.Tx) error {
 			return doPosting(tx, req)
 		}); err != nil {
 			pqErr, ok := err.(*pq.Error)
 			if ok {
 				if pqErr.Code.Class() == pq.ErrorClass("23") {
-					// Integrity violations. Note that (especially with Postgres)
-					// the primary key will often be violated under congestion.
+					// Integrity violations. Don't expect many.
 					l("%s", pqErr)
 					continue
 				}
 				if pqErr.Code.Class() == pq.ErrorClass("40") {
 					// Transaction rollback errors (e.g. Postgres
 					// serializability restarts)
-					l("%s", pqErr)
+					if *verbose {
+						l("%s", pqErr)
+					}
 					continue
 				}
 			}
@@ -218,6 +230,7 @@ func worker(db *sql.DB, l func(string, ...interface{}), gen func() postingReques
 				l("success")
 			}
 			counter.Incr(1)
+			atomic.AddInt32(&num, 1)
 		}
 	}
 }
@@ -257,8 +270,6 @@ func main() {
 		log.Print(err)
 	}
 
-	//db.SetMaxOpenConns(*concurrency)
-
 	for i := 0; i < *concurrency; i++ {
 		num := i
 		go worker(db, func(s string, args ...interface{}) {
@@ -271,7 +282,8 @@ func main() {
 		for {
 			select {
 			case <-t.C:
-				log.Printf("%d postings/seq", counter.Rate())
+				log.Printf("%d postings/seq (%d total)", counter.Rate(),
+					atomic.LoadInt32(&num))
 			}
 		}
 	}()
